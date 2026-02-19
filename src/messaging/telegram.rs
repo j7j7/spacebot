@@ -20,6 +20,8 @@ use std::time::Instant;
 use tokio::sync::{RwLock, mpsc};
 use tokio::task::JoinHandle;
 
+const HTTP_CLIENT_TIMEOUT_SECONDS: u64 = 60;
+
 /// Telegram adapter state.
 pub struct TelegramAdapter {
     permissions: Arc<ArcSwap<TelegramPermissions>>,
@@ -53,7 +55,13 @@ impl TelegramAdapter {
         permissions: Arc<ArcSwap<TelegramPermissions>>,
     ) -> Self {
         let token = token.into();
-        let bot = Bot::new(&token);
+
+        let http_client = reqwest::Client::builder()
+            .timeout(std::time::Duration::from_secs(HTTP_CLIENT_TIMEOUT_SECONDS))
+            .build()
+            .expect("failed to build HTTP client for Telegram adapter");
+
+        let bot = Bot::new(&token).set_client(http_client);
         Self {
             permissions,
             bot,
@@ -102,13 +110,42 @@ impl Messaging for TelegramAdapter {
 
         *self.shutdown_tx.write().await = Some(shutdown_tx);
 
-        // Resolve bot identity
-        let me = self
-            .bot
-            .get_me()
-            .send()
+        // Resolve bot identity with retry (with timeout to avoid hanging on network issues)
+        let mut me = None;
+        let mut delay = std::time::Duration::from_millis(1000);
+        for attempt in 0..5 {
+            match tokio::time::timeout(
+                std::time::Duration::from_secs(10),
+                self.bot.get_me().send()
+            )
             .await
-            .context("failed to call getMe on Telegram")?;
+            {
+                Ok(Ok(result)) => {
+                    me = Some(result);
+                    break;
+                }
+                Ok(Err(e)) => {
+                    tracing::warn!(
+                        attempt = attempt + 1,
+                        %e,
+                        "getMe call failed, retrying in {:?}",
+                        delay
+                    );
+                }
+                Err(_) => {
+                    tracing::warn!(
+                        attempt = attempt + 1,
+                        "getMe call timed out, retrying in {:?}",
+                        delay
+                    );
+                }
+            }
+            if attempt < 4 {
+                tokio::time::sleep(delay).await;
+                delay *= 2;
+            }
+        }
+        let me = me.context("getMe call failed after 5 retries")?;
         *self.bot_user_id.write().await = Some(me.id);
         *self.bot_username.write().await = me.username.clone();
         tracing::info!(
@@ -131,7 +168,7 @@ impl Messaging for TelegramAdapter {
                         tracing::info!("telegram polling loop shutting down");
                         break;
                     }
-                    result = bot.get_updates().offset(offset).timeout(10).send() => {
+                    result = bot.get_updates().offset(offset).timeout(30).send() => {
                         let updates = match result {
                             Ok(updates) => updates,
                             Err(error) => {
@@ -174,8 +211,10 @@ impl Messaging for TelegramAdapter {
                                         continue;
                                     }
                                 }
-                            } else if let Some(filter) = &permissions.chat_filter {
-                                // Chat filter: if configured, only allow listed group/channel chats
+                            }
+
+                            // Chat filter: if configured, only allow listed chats
+                            if let Some(filter) = &permissions.chat_filter {
                                 if !filter.contains(&chat_id) {
                                     continue;
                                 }
@@ -358,26 +397,6 @@ impl Messaging for TelegramAdapter {
             }
             OutboundResponse::Status(status) => {
                 self.send_status(message, status).await?;
-            }
-            // Slack-specific variants — graceful fallbacks for Telegram
-            OutboundResponse::RemoveReaction(_) => {} // no-op
-            OutboundResponse::Ephemeral { text, .. } => {
-                // Telegram has no ephemeral messages — send as regular text
-                let chat_id = self.extract_chat_id(message)?;
-                self.bot.send_message(chat_id, text).await
-                    .context("failed to send ephemeral fallback on telegram")?;
-            }
-            OutboundResponse::RichMessage { text, .. } => {
-                // No Block Kit on Telegram — plain text fallback
-                let chat_id = self.extract_chat_id(message)?;
-                self.bot.send_message(chat_id, text).await
-                    .context("failed to send rich message fallback on telegram")?;
-            }
-            OutboundResponse::ScheduledMessage { text, .. } => {
-                // Telegram has no scheduled messages — send immediately
-                let chat_id = self.extract_chat_id(message)?;
-                self.bot.send_message(chat_id, text).await
-                    .context("failed to send scheduled message fallback on telegram")?;
             }
         }
 

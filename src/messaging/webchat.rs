@@ -82,7 +82,11 @@ impl Messaging for WebChatAdapter {
             OutboundResponse::StreamEnd => (WebChatEvent::StreamEnd, true),
             OutboundResponse::File { .. }
             | OutboundResponse::Reaction(_)
+            | OutboundResponse::RemoveReaction(_)
             | OutboundResponse::Status(_) => return Ok(()),
+            OutboundResponse::Ephemeral { text, .. }
+            | OutboundResponse::RichMessage { text, .. }
+            | OutboundResponse::ScheduledMessage { text, .. } => (WebChatEvent::Text(text), true),
         };
 
         let _ = tx.send(event).await;

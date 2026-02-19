@@ -1,5 +1,6 @@
 //! Exec tool for running subprocesses (task workers only).
 
+use anyhow::Context as _;
 use rig::completion::ToolDefinition;
 use rig::tool::Tool;
 use schemars::JsonSchema;
@@ -332,5 +333,3 @@ pub struct ExecResult {
     pub stdout: String,
     pub stderr: String,
 }
-
-use anyhow::Context as _;
